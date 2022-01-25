@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  generateName: port
+spec:
+  restartPolicy: OnFailure
+  containers:
+  - image: centos:7
+    name: pod
+    command: ["sleep"]
+    args: ["1000"]
+    resources:
+      limits:
+        github.com/port: 2
