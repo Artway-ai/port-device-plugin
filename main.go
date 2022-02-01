@@ -1,3 +1,19 @@
+/*
+Copyright 2022 kuizhiqing.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package main
 
 import (
@@ -20,28 +36,20 @@ func main() {
 
 	var minPort int
 	var maxPort int
-	var backup int
 
 	flag.IntVar(&minPort, "min", 0, "the smallest port can be be allocated")
-	flag.IntVar(&maxPort, "max", 0, "the largest  port can be be allocated")
-	flag.IntVar(&backup, "backup", 1, "the number of backup")
+	flag.IntVar(&maxPort, "max", 1000, "the largest port can be be allocated")
 	flag.Parse()
 
-	klog.V(1).Infof("Port device plugin started")
-
 	var opt *plugin.PortOpt
-	if minPort > 0 && maxPort > minPort {
-		delim := maxPort
-		if backup > 0 {
-			delim = (maxPort + minPort) / (backup + 1)
-		}
-		opt = &plugin.PortOpt{
-			Min:    minPort,
-			Max:    maxPort,
-			Delim:  delim,
-			Backup: backup,
-		}
+	delim := maxPort - (maxPort-minPort)/10
+	opt = &plugin.PortOpt{
+		Min:   minPort,
+		Max:   maxPort,
+		Delim: delim,
 	}
+
+	klog.Infof("Ports will be allocated between %d-%d, while %d-%d are reserved for replacing when conflict", minPort, delim, delim, maxPort)
 
 	plug := plugin.NewPortDevicePlugin(
 		resourceName,

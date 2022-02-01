@@ -1,12 +1,27 @@
+/*
+Copyright 2022 kuizhiqing.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package plugin
 
 import (
-	"fmt"
-	"log"
 	"net"
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,8 +44,6 @@ type PortOpt struct {
 	Max int
 	// delimitation, [min, delim) for allocation and [delim, max) for backup
 	Delim int
-	// number of backup
-	Backup int
 }
 
 // PortDevicePlugin implements the Kubernetes device plugin API
@@ -43,9 +56,12 @@ type PortDevicePlugin struct {
 
 	portOpt *PortOpt
 
+	// alternative ports cursor
+	cursor int
+
 	server        *grpc.Server
-	cachedDevices []*Device
-	health        chan *Device
+	cachedDevices []*pluginapi.Device
+	health        chan *pluginapi.Device
 	stop          chan interface{}
 }
 
@@ -57,6 +73,8 @@ func NewPortDevicePlugin(resourceName string, deviceListEnvvar string, deviceLis
 		deviceListAnnotations: deviceListAnnotations,
 		socket:                socket,
 		portOpt:               portOpt,
+
+		cursor: portOpt.Delim,
 
 		// These will be reinitialized every
 		// time the plugin server is restarted.
@@ -79,26 +97,26 @@ func (m *PortDevicePlugin) cleanup() {
 // and starts the device healthchecks.
 func (m *PortDevicePlugin) Start() error {
 	m.cachedDevices = m.Devices()
-	klog.V(1).Infof("cached device %d", len(m.cachedDevices))
+	klog.Infof("cached device %d", len(m.cachedDevices))
 	m.server = grpc.NewServer([]grpc.ServerOption{}...)
-	m.health = make(chan *Device)
+	m.health = make(chan *pluginapi.Device)
 	m.stop = make(chan interface{})
 
 	err := m.Serve()
 	if err != nil {
-		log.Printf("Could not start device plugin for '%s': %s", m.resourceName, err)
+		klog.Fatalf("Could not start device plugin for '%s': %s", m.resourceName, err)
 		m.cleanup()
 		return err
 	}
-	log.Printf("Starting to serve '%s' on %s", m.resourceName, m.socket)
+	klog.Infof("Starting to serve '%s' on %s", m.resourceName, m.socket)
 
 	err = m.Register()
 	if err != nil {
-		log.Printf("Could not register device plugin: %s", err)
+		klog.Fatalf("Could not register device plugin: %s", err)
 		m.Stop()
 		return err
 	}
-	log.Printf("Registered device plugin for '%s' with Kubelet", m.resourceName)
+	klog.Infof("Registered device plugin for '%s' with Kubelet", m.resourceName)
 
 	<-m.stop
 
@@ -112,7 +130,7 @@ func (m *PortDevicePlugin) Stop() error {
 	if m == nil || m.server == nil {
 		return nil
 	}
-	log.Printf("Stopping to serve '%s' on %s", m.resourceName, m.socket)
+	klog.Infof("Stopping to serve '%s' on %s", m.resourceName, m.socket)
 	m.server.Stop()
 	if err := os.Remove(m.socket); err != nil && !os.IsNotExist(err) {
 		return err
@@ -135,19 +153,19 @@ func (m *PortDevicePlugin) Serve() error {
 		lastCrashTime := time.Now()
 		restartCount := 0
 		for {
-			log.Printf("Starting GRPC server for '%s'", m.resourceName)
+			klog.Infof("Starting GRPC server for '%s'", m.resourceName)
 			err := m.server.Serve(sock)
 			if err == nil {
 				break
 			}
 
-			log.Printf("GRPC server for '%s' crashed with error: %v", m.resourceName, err)
+			klog.Infof("GRPC server for '%s' crashed with error: %v", m.resourceName, err)
 
 			// restart if it has not been too often
 			// i.e. if server has crashed more than 5 times and it didn't last more than one hour each time
 			if restartCount > 5 {
 				// quit
-				log.Fatalf("GRPC server for '%s' has repeatedly crashed recently. Quitting", m.resourceName)
+				klog.Fatalf("GRPC server for '%s' has repeatedly crashed recently. Quitting", m.resourceName)
 			}
 			timeSinceLastCrash := time.Since(lastCrashTime).Seconds()
 			lastCrashTime = time.Now()
@@ -195,88 +213,18 @@ func (m *PortDevicePlugin) Register() error {
 	return nil
 }
 
-func (m *PortDevicePlugin) backupPolicy(id int) []int {
-	shift := m.portOpt.Delim - m.portOpt.Min
-	back := []int{}
-	for i := 0; i < m.portOpt.Backup; i++ {
-		b := shift * i
-		if b < m.portOpt.Max {
-			back = append(back, b)
-		} else {
-			break
-		}
-	}
-	return back
-}
-
-func (m *PortDevicePlugin) Devices() []*Device {
-	var devs []*Device
-	if m.portOpt == nil {
-		for i := 0; i < 1000; i++ {
-			d := NewDevice(i, nil)
-			devs = append(devs, d)
-		}
-	} else {
-		for i := m.portOpt.Min; i < m.portOpt.Delim; i++ {
-			d := NewDevice(i, m.backupPolicy(i))
-			devs = append(devs, d)
-		}
-	}
-	return devs
-}
-
-func (m *PortDevicePlugin) getPortsByIDs(plist []string) ([]string, error) {
-	devs, err := m.getDevicesByIDs(plist)
-	if err != nil {
-		return nil, err
-	}
-	ids, err := m.getPortsByDevices(devs)
-	if err != nil {
-		return nil, err
-	}
-	return ids, nil
-}
-
-func (m *PortDevicePlugin) getDevicesByIDs(plist []string) ([]*Device, error) {
-	var devs []*Device
-	for _, pd := range plist {
-		for j, d := range m.cachedDevices {
-			if d.ID == pd {
-				devs = append(devs, m.cachedDevices[j])
-				continue
-			}
-		}
-	}
-	if len(devs) != len(plist) {
-		return nil, fmt.Errorf("device not found %v", plist)
-	}
-	return devs, nil
-}
-
-func (m *PortDevicePlugin) getPortsByDevices(devs []*Device) ([]string, error) {
-	ps := make([]string, len(devs))
-	for i, dv := range devs {
-		p, err := dv.availablePort()
-		if err != nil {
-			return nil, err
-		}
-		ps[i] = p
-	}
-	return ps, nil
-}
-
 // GetDevicePluginOptions returns the values of the optional settings for this plugin
 func (m *PortDevicePlugin) GetDevicePluginOptions(context.Context, *pluginapi.Empty) (*pluginapi.DevicePluginOptions, error) {
 	options := &pluginapi.DevicePluginOptions{
-		PreStartRequired:                true,
-		GetPreferredAllocationAvailable: true,
+		PreStartRequired:                false,
+		GetPreferredAllocationAvailable: false,
 	}
 	return options, nil
 }
 
 // ListAndWatch lists devices and update that list according to the health status
 func (m *PortDevicePlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.DevicePlugin_ListAndWatchServer) error {
-	s.Send(&pluginapi.ListAndWatchResponse{Devices: m.apiDevices()})
+	s.Send(&pluginapi.ListAndWatchResponse{Devices: m.cachedDevices})
 
 	for {
 		select {
@@ -307,14 +255,10 @@ func (m *PortDevicePlugin) Allocate(ctx context.Context, reqs *pluginapi.Allocat
 	responses := pluginapi.AllocateResponse{}
 	for _, req := range reqs.ContainerRequests {
 		var ids []string
-		if m.portOpt == nil {
+		if m.portOpt.Min == 0 {
 			ids = NewFreePorts(len(req.DevicesIDs))
 		} else {
-			var err error
-			ids, err = m.getPortsByIDs(req.DevicesIDs)
-			if err != nil {
-				return nil, err
-			}
+			ids = m.validatedPorts(req.DevicesIDs)
 		}
 
 		response := pluginapi.ContainerAllocateResponse{}
@@ -324,7 +268,7 @@ func (m *PortDevicePlugin) Allocate(ctx context.Context, reqs *pluginapi.Allocat
 
 		responses.ContainerResponses = append(responses.ContainerResponses, &response)
 
-		log.Println("Ports allocated", ids)
+		klog.Info("Ports allocated ", ids)
 	}
 	return &responses, nil
 }
@@ -350,12 +294,42 @@ func (m *PortDevicePlugin) dial(unixSocketPath string, timeout time.Duration) (*
 	return c, nil
 }
 
-func (m *PortDevicePlugin) apiDevices() []*pluginapi.Device {
-	var pdevs []*pluginapi.Device
-	for _, d := range m.cachedDevices {
-		pdevs = append(pdevs, &d.Device)
+func (m *PortDevicePlugin) Devices() []*pluginapi.Device {
+	var devs []*pluginapi.Device
+
+	for i := m.portOpt.Min; i < m.portOpt.Delim; i++ {
+		devs = append(devs,
+			&pluginapi.Device{
+				ID:     strconv.Itoa(i),
+				Health: pluginapi.Healthy,
+			})
 	}
-	return pdevs
+	return devs
+}
+
+func (m *PortDevicePlugin) validatedPorts(rids []string) []string {
+	var ids []string
+	for _, id := range rids {
+		if !IsAvailable(id) {
+			id = m.alternatePort()
+		}
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func (m *PortDevicePlugin) alternatePort() string {
+	for {
+		p := strconv.Itoa(m.cursor)
+		m.cursor++
+		if IsAvailable(p) {
+			return p
+		}
+		if m.cursor >= m.portOpt.Max {
+			m.cursor = m.portOpt.Delim
+			time.Sleep(time.Second)
+		}
+	}
 }
 
 func (m *PortDevicePlugin) apiEnvs(deviceIDs []string) map[string]string {
@@ -382,4 +356,42 @@ func (m *PortDevicePlugin) apiMounts(deviceIDs []string) []*pluginapi.Mount {
 	}
 
 	return mounts
+}
+
+func NewFreePort() (port int, err error) {
+	if addr, err := net.ResolveTCPAddr("tcp", "0.0.0.0:0"); err == nil {
+		if l, err := net.ListenTCP("tcp", addr); err == nil {
+			defer l.Close()
+			return l.Addr().(*net.TCPAddr).Port, nil
+		}
+		return 0, err
+	}
+	return 0, err
+}
+
+func NewFreePorts(n int) []string {
+	ps := make([]string, n)
+	i := 0
+	for i < n {
+		p, err := NewFreePort()
+		if err == nil {
+			ps[i] = strconv.Itoa(p)
+			i++
+		}
+	}
+	return ps
+}
+
+func IsAvailable(port string) bool {
+	address := net.JoinHostPort("", port)
+	conn, err := net.DialTimeout("tcp", address, time.Second)
+	if conn != nil {
+		conn.Close()
+	}
+
+	if err == nil {
+		return false
+	} else {
+		return true
+	}
 }

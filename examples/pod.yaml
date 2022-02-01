@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: Pod
 metadata:
-  generateName: port
+  generateName: port-
 spec:
   restartPolicy: OnFailure
   containers:
